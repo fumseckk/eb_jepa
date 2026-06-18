@@ -150,6 +150,11 @@ EXAMPLE_CONFIGS = {
         "module": "examples.gray_scott.main",
         "metric": "vrmse",
     },
+    "intuitive_physics": {
+        "config": "examples/intuitive_physics/cfgs/train.yaml",
+        "module": "examples.intuitive_physics.main",
+        "metric": "train/pred_loss",
+    },
 }
 
 # =============================================================================
@@ -434,7 +439,8 @@ if __name__ == "__main__":
         type=str,
         required=True,
         choices=["image_jepa", "video_jepa", "ac_video_jepa", "maze",
-                 "fintime", "ltsf", "eeg", "audio", "pointcloud", "gray_scott"],
+                 "fintime", "ltsf", "eeg", "audio", "pointcloud", "gray_scott",
+                 "intuitive_physics"],
         help="Which example to run",
     )
     parser.add_argument(
