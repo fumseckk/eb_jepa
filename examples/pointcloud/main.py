@@ -20,6 +20,7 @@ import os
 import sys
 
 import torch
+import torch.nn as nn
 from omegaconf import OmegaConf
 
 from eb_jepa.datasets.pointcloud.dataset import PointCloudConfig, make_loader
@@ -42,7 +43,40 @@ def build_encoder(cfg):
     over the N points gives a PERMUTATION-INVARIANT global feature (PointNet, Qi
     et al. 2017; no T-Net needed). The max-pool is what makes it order-agnostic;
     rotation invariance, in contrast, has to be LEARNED from the augmented views."""
-    raise NotImplementedError("TODO: build the PointNet encoder (see docstring)")
+    in_channels = int(getattr(cfg, "in_channels", 3))
+    out_dim = int(getattr(cfg, "out_dim", 1024))
+
+    class PointNetEncoder(nn.Module):
+        def __init__(self, in_ch, out_d):
+            super().__init__()
+            self.out_dim = out_d
+            self.net = nn.Sequential(
+                nn.Conv1d(in_ch, 64, kernel_size=1, bias=False),
+                nn.BatchNorm1d(64),
+                nn.ReLU(inplace=True),
+                nn.Conv1d(64, 64, kernel_size=1, bias=False),
+                nn.BatchNorm1d(64),
+                nn.ReLU(inplace=True),
+                nn.Conv1d(64, 128, kernel_size=1, bias=False),
+                nn.BatchNorm1d(128),
+                nn.ReLU(inplace=True),
+                nn.Conv1d(128, out_d, kernel_size=1, bias=False),
+                nn.BatchNorm1d(out_d),
+                nn.ReLU(inplace=True),
+            )
+
+        def represent(self, x):
+            if x.dim() != 3:
+                raise ValueError(f"expected [B, C, N] point cloud tensor, got {tuple(x.shape)}")
+            if x.shape[1] != in_channels and x.shape[2] == in_channels:
+                x = x.transpose(1, 2)
+            h = self.net(x)
+            return torch.max(h, dim=2).values
+
+        def forward(self, x):
+            return self.represent(x)
+
+    return PointNetEncoder(in_channels, out_dim)
 
 
 # --------------------------------------------------------------------------- #
@@ -60,7 +94,39 @@ def build_ssl(encoder, cfg):
     invariance (MSE) term is what pulls the two views of the same object together
     and makes the representation VIEW-INVARIANT. Return the scalar loss and a logs
     dict (e.g. the VICRegLoss component breakdown)."""
-    raise NotImplementedError("TODO: assemble the two-view VICReg objective (see docstring)")
+    projector_spec = getattr(cfg, "projector", None) or getattr(cfg, "proj", None)
+    if projector_spec is None:
+        projector_spec = f"{encoder.out_dim}-2048-2048"
+    elif isinstance(projector_spec, (list, tuple)):
+        projector_spec = "-".join(str(int(v)) for v in projector_spec)
+        if not projector_spec.startswith(f"{encoder.out_dim}-"):
+            projector_spec = f"{encoder.out_dim}-{projector_spec}"
+    else:
+        projector_spec = str(projector_spec)
+        if not projector_spec.startswith(f"{encoder.out_dim}-"):
+            projector_spec = f"{encoder.out_dim}-{projector_spec}"
+
+    std_coeff = float(getattr(cfg, "std_coeff", 25.0))
+    cov_coeff = float(getattr(cfg, "cov_coeff", 1.0))
+
+    class TwoViewVICReg(nn.Module):
+        def __init__(self, enc):
+            super().__init__()
+            from eb_jepa.architectures import Projector
+            from eb_jepa.losses import VICRegLoss
+
+            self.encoder = enc
+            self.projector = Projector(projector_spec)
+            self.criterion = VICRegLoss(std_coeff=std_coeff, cov_coeff=cov_coeff)
+
+        def compute_loss(self, batch):
+            v1, v2, *_ = batch
+            z1 = self.projector(self.encoder.represent(v1))
+            z2 = self.projector(self.encoder.represent(v2))
+            loss_dict = self.criterion(z1, z2)
+            return loss_dict["loss"], loss_dict
+
+    return TwoViewVICReg(encoder)
 
 
 # --------------------------------------------------------------------------- #

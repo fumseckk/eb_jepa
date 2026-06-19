@@ -11,6 +11,7 @@ import sys
 
 import numpy as np
 import torch
+import torch.nn as nn
 from omegaconf import OmegaConf
 
 from eb_jepa.datasets.pointcloud.dataset import PointCloudConfig, PointCloudDataset
@@ -46,7 +47,52 @@ def probe(Xtr, ytr, Xte, yte, n_classes):
     To make the number meaningful, also run this probe on a RANDOM untrained
     encoder (floor), and ideally compare rotate=none|z|so3 checkpoints — accuracy
     should drop monotonically as more rotation invariance is demanded."""
-    raise NotImplementedError("TODO: implement the linear probe + accuracy (see docstring)")
+    Xtr = np.asarray(Xtr, dtype=np.float32)
+    Xte = np.asarray(Xte, dtype=np.float32)
+    ytr = np.asarray(ytr, dtype=np.int64).reshape(-1)
+    yte = np.asarray(yte, dtype=np.int64).reshape(-1)
+
+    mu = Xtr.mean(axis=0, keepdims=True)
+    sigma = Xtr.std(axis=0, keepdims=True) + 1e-6
+    Xtr = (Xtr - mu) / sigma
+    Xte = (Xte - mu) / sigma
+
+    chance = 100.0 / float(n_classes)
+
+    try:
+        from sklearn.linear_model import LogisticRegression
+        clf = LogisticRegression(
+            max_iter=2000,
+            multi_class="multinomial",
+            solver="lbfgs",
+            n_jobs=1,
+        )
+        clf.fit(Xtr, ytr)
+        acc = float(clf.score(Xte, yte) * 100.0)
+    except Exception:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        Xtr_t = torch.from_numpy(Xtr).to(device)
+        ytr_t = torch.from_numpy(ytr).to(device)
+        Xte_t = torch.from_numpy(Xte).to(device)
+        yte_t = torch.from_numpy(yte).to(device)
+
+        model = nn.Linear(Xtr.shape[1], n_classes).to(device)
+        opt = torch.optim.LBFGS(model.parameters(), lr=1.0, max_iter=100, line_search_fn="strong_wolfe")
+        loss_fn = nn.CrossEntropyLoss()
+
+        def closure():
+            opt.zero_grad(set_to_none=True)
+            logits = model(Xtr_t)
+            loss = loss_fn(logits, ytr_t)
+            loss.backward()
+            return loss
+
+        opt.step(closure)
+        with torch.no_grad():
+            preds = model(Xte_t).argmax(dim=1)
+            acc = float((preds == yte_t).float().mean().item() * 100.0)
+
+    return {"accuracy": acc, "chance": chance, "gap": acc - chance}
 
 
 def main():
