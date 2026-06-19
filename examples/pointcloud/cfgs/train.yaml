@@ -8,15 +8,14 @@ data:
   n_classes: 40
   batch_size: 128
   num_workers: 8
-  rotate: so3            # so3 (full view-invariance) | z (azimuth only) | none
+  rotate: none            # so3 (full view-invariance) | z (azimuth only) | none
   jitter: 0.01
   scale_lo: 0.8
   scale_hi: 1.25
 model:
   in_channels: 3        # (x, y, z)
   out_dim: 1024         # PointNet global feature dim D
-  # TODO: add the hyperparameters your encoder / objective need
-  #       (projector spec e.g. '1024-2048-2048', std_coeff, cov_coeff, ...)
+  projector: 1024-2048-2048
   std_coeff: 25.0
   cov_coeff: 1.0
 optim:

@@ -150,6 +150,11 @@ EXAMPLE_CONFIGS = {
         "module": "examples.pointcloud.main",
         "metric": "accuracy",
     },
+    "pointcloud_eval": {
+        "config": "examples/pointcloud/cfgs/eval.yaml",
+        "module": "examples.pointcloud.eval",
+        "metric": "accuracy",
+    },
     "gray_scott": {
         "config": "examples/gray_scott/cfgs/train.yaml",
         "module": "examples.gray_scott.main",
@@ -451,7 +456,8 @@ if __name__ == "__main__":
         type=str,
         required=True,
         choices=["image_jepa", "video_jepa", "ac_video_jepa", "maze",
-                 "fintime", "ltsf", "eeg", "audio", "pointcloud", "gray_scott",
+                 "fintime", "ltsf", "eeg", "audio", "pointcloud",
+                 "pointcloud_eval", "gray_scott",
                  "intuitive_physics","factors_of_variation"],
         help="Which example to run",
     )

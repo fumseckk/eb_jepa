@@ -1,0 +1,4 @@
+=== Host: dalianvl01 | Arch: aarch64 | Date: Fri Jun 19 09:03:44 PM CEST 2026 ===
+=== GPU: NVIDIA GB200, 189471 MiB ===
+=== venv: /lustre/work/vivatech-aroundtheworld/gmaire/venvs/eb_jepa_aarch64 ===
+>>> Launching pointcloud training...

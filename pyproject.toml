@@ -19,6 +19,7 @@ authors = [
 dependencies = [
     "einops>=0.8.1",
     "fire>=0.7.0",
+    "h5py>=3.11.0",
     "huggingface-hub>=0.33.2",
     "matplotlib>=3.10.3",
     "opencv-python>=4.12.0.88",

@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "/usr/lib64/python3.9/runpy.py", line 197, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/usr/lib64/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/lustre/work/vivatech-aroundtheworld/gmaire/eb_jepa/examples/pointcloud/main.py", line 22, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+srun: error: dalianvl01: task 0: Exited with exit code 1

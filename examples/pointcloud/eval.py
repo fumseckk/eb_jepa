@@ -8,6 +8,7 @@ that makes the result meaningful: the frozen SSL encoder vs a random-encoder flo
 Run:  python -m examples.pointcloud.eval --ckpt <.../latest.pth.tar>
 """
 import sys
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -95,19 +96,48 @@ def probe(Xtr, ytr, Xte, yte, n_classes):
     return {"accuracy": acc, "chance": chance, "gap": acc - chance}
 
 
-def main():
-    ckpt = sys.argv[sys.argv.index("--ckpt") + 1]
+def run(fname="examples/pointcloud/cfgs/eval.yaml", cfg=None, folder=None, **overrides):
+    if cfg is None:
+        cfg = OmegaConf.load(fname)
+        if overrides:
+            cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist([f"{k}={v}" for k, v in overrides.items()]))
+
+    ckpt = getattr(cfg, "ckpt", None)
+    if not ckpt or str(ckpt).startswith("UPDATEME"):
+        raise ValueError(
+            "PointCloud evaluation needs a checkpoint path. Pass it as --ckpt <.../latest.pth.tar>."
+        )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     state = torch.load(ckpt, map_location=device, weights_only=False)
-    cfg = OmegaConf.create(state["cfg"])
-    encoder = build_encoder(cfg.model).to(device)
-    encoder.load_state_dict(state["encoder"]); encoder.eval()
+    train_cfg = OmegaConf.create(state["cfg"])
+    encoder = build_encoder(train_cfg.model).to(device)
+    encoder.load_state_dict(state["encoder"])
+    encoder.eval()
 
-    dcfg = OmegaConf.to_container(cfg.data, resolve=True)
+    dcfg = OmegaConf.to_container(train_cfg.data, resolve=True)
     Xtr, ytr = extract_features(encoder, "train", dcfg, device)
     Xte, yte = extract_features(encoder, "test", dcfg, device)
-    print("[pointcloud-eval]", probe(Xtr, ytr, Xte, yte, dcfg["n_classes"]))
+    n_classes = int(getattr(cfg, "n_classes", dcfg["n_classes"]))
+    metrics = probe(Xtr, ytr, Xte, yte, n_classes)
+
+    print("[pointcloud-eval]", metrics)
+    if folder is not None:
+        Path(folder).mkdir(parents=True, exist_ok=True)
+        with open(Path(folder) / "metrics.json", "w", encoding="utf-8") as f:
+            import json
+
+            json.dump(metrics, f, indent=2, sort_keys=True)
+    return metrics
+
+
+def main():
+    ckpt = sys.argv[sys.argv.index("--ckpt") + 1]
+    fname = sys.argv[sys.argv.index("--fname") + 1] if "--fname" in sys.argv \
+        else "examples/pointcloud/cfgs/eval.yaml"
+    cfg = OmegaConf.load(fname)
+    cfg.ckpt = ckpt
+    run(fname=fname, cfg=cfg)
 
 
 if __name__ == "__main__":

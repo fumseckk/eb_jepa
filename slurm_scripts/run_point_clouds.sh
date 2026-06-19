@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=eb_jepa_test
+#SBATCH --job-name=aroundtheworld_task
 #SBATCH --partition=defq
 #SBATCH --reservation=Vivatech
 # No hardcoded --account: SLURM uses your DEFAULT account (your team allocation), so this
@@ -13,7 +13,6 @@
 # auto-detected team segment, and the submit dir always exists on /work.
 #SBATCH --output=slurm_test_%j.out
 #SBATCH --error=slurm_test_%j.err
-
 set -e
 
 REPO="${EBJEPA_REPO:-$SLURM_SUBMIT_DIR}"
@@ -40,4 +39,7 @@ echo "=== venv: $UV_PROJECT_ENVIRONMENT ==="
 # uv run --project "$REPO" pytest "$REPO/tests/" -v
 
 # echo "=== Done ==="
+
+echo ">>> Launching pointcloud training..."
+srun python -m examples.pointcloud.main --fname examples/pointcloud/cfgs/train.yaml
 
