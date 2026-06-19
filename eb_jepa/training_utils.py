@@ -340,6 +340,14 @@ def get_exp_name(example_name: str, cfg) -> str:
             f"_simt{cfg.model.regularizer.get('sim_coeff_t')}"
             f"_idm{cfg.model.regularizer.get('idm_coeff')}"
         )
+    elif example_name in {"pointcloud", "pointcloud_eval"}:
+        rotate = getattr(cfg.data, "rotate", "none")
+        return (
+            f"pc_{rotate}"
+            f"_od{getattr(cfg.model, 'out_dim', 'na')}"
+            f"_std{getattr(cfg.model, 'std_coeff', 'na')}"
+            f"_cov{getattr(cfg.model, 'cov_coeff', 'na')}"
+        )
     else:
         return "exp"
 

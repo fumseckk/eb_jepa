@@ -18,12 +18,14 @@ Run:  python -m examples.pointcloud.main --fname examples/pointcloud/cfgs/train.
 """
 import os
 import sys
+from dataclasses import asdict
 
 import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
 
 from eb_jepa.datasets.pointcloud.dataset import PointCloudConfig, make_loader
+from eb_jepa.training_utils import setup_wandb
 
 # Reuse the eb_jepa core — DO NOT reimplement these:
 #   eb_jepa.architectures: Projector (MLP from a '256-512-128'-style spec string)
@@ -129,6 +131,37 @@ def build_ssl(encoder, cfg):
     return TwoViewVICReg(encoder)
 
 
+@torch.no_grad()
+def evaluate_ssl(ssl, loader, device):
+    ssl.eval()
+    totals = {}
+    count = 0
+    for batch in loader:
+        batch = batch.to(device) if torch.is_tensor(batch) else [b.to(device) for b in batch]
+        loss, logs = ssl.compute_loss(batch)
+        count += 1
+        totals["loss"] = totals.get("loss", 0.0) + float(loss.item())
+        for k, v in logs.items():
+            totals[k] = totals.get(k, 0.0) + float(v.item() if torch.is_tensor(v) else v)
+    if count == 0:
+        return {"loss": 0.0}
+    return {k: v / count for k, v in totals.items()}
+
+
+@torch.no_grad()
+def evaluate_probe(encoder, cfg, device):
+    from examples.pointcloud.eval import extract_features, probe
+
+    dcfg = PointCloudConfig(**OmegaConf.to_container(cfg.data, resolve=True))
+    dcfg.split = "train"
+    dcfg.mode = "supervised"
+    dcfg_dict = asdict(dcfg)
+    Xtr, ytr = extract_features(encoder, "train", dcfg_dict, device)
+    Xte, yte = extract_features(encoder, "test", dcfg_dict, device)
+    metrics = probe(Xtr, ytr, Xte, yte, int(cfg.data.n_classes))
+    return metrics
+
+
 # --------------------------------------------------------------------------- #
 # TRAINING LOOP  — provided
 # --------------------------------------------------------------------------- #
@@ -145,12 +178,29 @@ def run(fname="examples/pointcloud/cfgs/train.yaml", cfg=None, folder=None, **ov
     dcfg.mode = "ssl"
     loader = make_loader(dcfg)
 
+    dcfg_eval = PointCloudConfig(**OmegaConf.to_container(cfg.data, resolve=True))
+    dcfg_eval.split = "test"
+    dcfg_eval.mode = "ssl"
+    eval_loader = make_loader(dcfg_eval, shuffle=False)
+
     encoder = build_encoder(cfg.model).to(device)
     ssl = build_ssl(encoder, cfg.model).to(device)
     opt = torch.optim.AdamW(ssl.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
 
+    wandb_run = setup_wandb(
+        project="eb_jepa",
+        config={"example": "pointcloud", **OmegaConf.to_container(cfg, resolve=True)},
+        run_dir=folder or cfg.meta.ckpt_dir,
+        run_name=f"pointcloud_{cfg.data.rotate}",
+        tags=["pointcloud", f"rotate_{cfg.data.rotate}", f"seed_{cfg.meta.seed}"],
+        group=cfg.logging.get("wandb_group"),
+        enabled=cfg.logging.get("log_wandb", False),
+        sweep_id=cfg.logging.get("wandb_sweep_id"),
+    )
+
     ckpt_dir = folder or cfg.meta.ckpt_dir
     os.makedirs(ckpt_dir, exist_ok=True)
+    eval_every = int(cfg.logging.get("eval_every", 1))
     for epoch in range(cfg.optim.epochs):
         ssl.train()
         for batch in loader:
@@ -158,10 +208,32 @@ def run(fname="examples/pointcloud/cfgs/train.yaml", cfg=None, folder=None, **ov
             opt.zero_grad(set_to_none=True)
             loss, logs = ssl.compute_loss(batch)
             loss.backward(); opt.step()
+        eval_logs = None
+        if eval_every > 0 and (epoch % eval_every == 0 or epoch == cfg.optim.epochs - 1):
+            eval_logs = evaluate_ssl(ssl, eval_loader, device)
+            probe_logs = evaluate_probe(encoder, cfg, device)
+        if wandb_run:
+            import wandb
+
+            log_dict = {"epoch": epoch, **{f"train/{k}": v.item() if torch.is_tensor(v) else v for k, v in logs.items()}, "train/loss": loss.item()}
+            if eval_logs is not None:
+                log_dict.update({f"eval/{k}": v for k, v in eval_logs.items()})
+            if eval_every > 0 and (epoch % eval_every == 0 or epoch == cfg.optim.epochs - 1):
+                log_dict.update({f"probe/{k}": v for k, v in probe_logs.items()})
+            wandb.log(log_dict)
         print(f"[pointcloud:{cfg.data.rotate}] epoch {epoch} loss={loss.item():.4f} {logs}", flush=True)
+        if eval_logs is not None:
+            print(f"[pointcloud:{cfg.data.rotate}] epoch {epoch} eval={eval_logs}", flush=True)
+        if eval_every > 0 and (epoch % eval_every == 0 or epoch == cfg.optim.epochs - 1):
+            print(f"[pointcloud:{cfg.data.rotate}] epoch {epoch} probe={probe_logs}", flush=True)
         torch.save({"epoch": epoch, "encoder": encoder.state_dict(),
                     "cfg": OmegaConf.to_container(cfg, resolve=True)},
                    os.path.join(ckpt_dir, "latest.pth.tar"))
+
+    if wandb_run:
+        import wandb
+
+        wandb.finish()
     print(f"[pointcloud] done -> {ckpt_dir}/latest.pth.tar")
 
 

@@ -17,6 +17,7 @@ from omegaconf import OmegaConf
 
 from eb_jepa.datasets.pointcloud.dataset import PointCloudConfig, PointCloudDataset
 from examples.pointcloud.main import build_encoder
+from eb_jepa.training_utils import setup_wandb
 
 
 @torch.no_grad()
@@ -96,7 +97,13 @@ def probe(Xtr, ytr, Xte, yte, n_classes):
     return {"accuracy": acc, "chance": chance, "gap": acc - chance}
 
 
-def run(fname="examples/pointcloud/cfgs/eval.yaml", cfg=None, folder=None, **overrides):
+def run(
+    fname="examples/pointcloud/cfgs/eval.yaml",
+    cfg=None,
+    folder=None,
+    wandb_run=None,
+    **overrides,
+):
     if cfg is None:
         cfg = OmegaConf.load(fname)
         if overrides:
@@ -115,11 +122,33 @@ def run(fname="examples/pointcloud/cfgs/eval.yaml", cfg=None, folder=None, **ove
     encoder.load_state_dict(state["encoder"])
     encoder.eval()
 
-    dcfg = OmegaConf.to_container(train_cfg.data, resolve=True)
+    eval_data = OmegaConf.create(OmegaConf.to_container(getattr(cfg, "data", {}), resolve=True))
+    dcfg = OmegaConf.to_container(OmegaConf.merge(train_cfg.data, eval_data), resolve=True)
     Xtr, ytr = extract_features(encoder, "train", dcfg, device)
     Xte, yte = extract_features(encoder, "test", dcfg, device)
     n_classes = int(getattr(cfg, "n_classes", dcfg["n_classes"]))
     metrics = probe(Xtr, ytr, Xte, yte, n_classes)
+
+    own_wandb_run = None
+    if wandb_run is None:
+        own_wandb_run = setup_wandb(
+            project="eb_jepa",
+            config={"example": "pointcloud_eval", **OmegaConf.to_container(cfg, resolve=True)},
+            run_dir=folder or str(Path(ckpt).parent),
+            run_name=f"pointcloud_eval_{cfg.get('data', {}).get('rotate', dcfg.get('rotate', 'none'))}",
+            tags=["pointcloud", "pointcloud_eval"],
+            group=cfg.get("logging", {}).get("wandb_group") if hasattr(cfg, "get") else None,
+            enabled=cfg.get("logging", {}).get("log_wandb", False) if hasattr(cfg, "get") else False,
+            sweep_id=cfg.get("logging", {}).get("wandb_sweep_id") if hasattr(cfg, "get") else None,
+        )
+        wandb_run = own_wandb_run
+
+    if wandb_run:
+        import wandb
+
+        wandb.log({f"eval/{k}": v for k, v in metrics.items()})
+        if own_wandb_run is not None:
+            wandb.finish()
 
     print("[pointcloud-eval]", metrics)
     if folder is not None:

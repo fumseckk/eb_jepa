@@ -272,8 +272,11 @@ def copy_code_folder(code_folder):
                 ignored.append(n)
         return ignored
 
-    if not os.path.exists(code_folder):
-        shutil.copytree(".", code_folder, ignore=ignore_func)
+    # Always refresh the snapshot used by the job so code fixes propagate into
+    # existing experiment folders/sweeps instead of reusing stale copied code.
+    if os.path.exists(code_folder):
+        shutil.rmtree(code_folder)
+    shutil.copytree(".", code_folder, ignore=ignore_func)
 
 
 def setup_launch_environment(base_dir, logs_subdir: str | None = "slurm_logs"):
