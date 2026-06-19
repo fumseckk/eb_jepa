@@ -1,14 +1,17 @@
 #!/bin/bash
 #SBATCH --job-name=eb_jepa_test
 #SBATCH --partition=defq
-#SBATCH --account=pdl17890
+# No hardcoded --account: SLURM uses your DEFAULT account (your team allocation), so this
+# works on any team. Override with: sbatch --account=<acct> slurm_test.sh
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --time=00:30:00
-#SBATCH --output=/lustre/work/pdl17890/%u/logs/slurm_test_%j.out
-#SBATCH --error=/lustre/work/pdl17890/%u/logs/slurm_test_%j.err
+# Logs go to the submit dir (your work-repo): a static #SBATCH path can't hold the
+# auto-detected team segment, and the submit dir always exists on /work.
+#SBATCH --output=slurm_test_%j.out
+#SBATCH --error=slurm_test_%j.err
 
 set -e
 
