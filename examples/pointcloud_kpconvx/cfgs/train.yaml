@@ -1,0 +1,43 @@
+# PointCloud SSL pretraining config (ModelNet40, view-invariant VICReg).
+meta:
+  seed: 0
+  ckpt_dir: UPDATEME/checkpoints/pointcloud/dev
+data:
+  data_root: /lustre/work/pdl17890/udl806719/datasets/modelnet40/modelnet40_ply_hdf5_2048
+  n_points: 1024
+  n_classes: 40
+  batch_size: 32
+  num_workers: 8
+  rotate: none            # so3 (full view-invariance) | z (azimuth only) | none
+  jitter: 0.01
+  scale_lo: 0.8
+  scale_hi: 1.25
+sweep:
+  param_grid:
+    data.rotate: [none, z, so3]
+model:
+  encoder: kpconvx      # kpconvx (Apple CVPR 2024) | pointnet (legacy fallback)
+  in_channels: 3        # (x, y, z)
+  out_dim: 256          # KPConvX global feature dim D
+  projector: 256-2048-2048
+  std_coeff: 25.0
+  cov_coeff: 1.0
+  kpconvx:
+    layer_blocks: [2, 2, 2, 2]
+    first_features_dim: 32
+    shell_sizes: [1, 3, 3]           # 7 kernel points
+    conv_radius: 1.5
+    first_subsampling_dl: 0.02
+    fixed_kernel_points: center
+    kp_influence: linear
+    kp_aggregation: sum
+    norm: batch
+    bn_momentum: 0.02
+logging:
+  log_wandb: true
+  wandb_group:
+  eval_every: 5
+optim:
+  epochs: 60
+  lr: 1.0e-3
+  weight_decay: 1.0e-6
