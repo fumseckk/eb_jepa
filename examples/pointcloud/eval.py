@@ -48,19 +48,29 @@ def build_random_encoder(out_dim, device):
 
 
 @torch.no_grad()
-def extract_features(encoder, split, dcfg, device):
-    """Provided: frozen encoder -> [N, D] features + labels for `split`.
+def extract_features(encoder, split, dcfg, device, mode="supervised"):
+    """Frozen encoder -> [N, D] features + labels for `split`.
 
-    Uses the deterministic clean (supervised-mode) view so the probe sees one
-    canonical sampling per shape."""
-    cfg = PointCloudConfig(**{**dcfg, "split": split, "mode": "supervised"})
-    ds = PointCloudDataset(cfg)
-    loader = torch.utils.data.DataLoader(ds, batch_size=256, shuffle=False, num_workers=8)
-    X, y = [], []
-    for xb, yb in loader:
-        X.append(encoder.represent(xb.to(device)).cpu().numpy())
-        y.append(np.asarray(yb))
-    return np.concatenate(X), np.concatenate(y)
+    mode="supervised": deterministic clean (canonical) view, no rotation.
+    mode="ssl": one randomly-augmented view using the training rotation setting,
+                so the rotated probe can measure true rotation invariance."""
+    was_training = encoder.training
+    encoder.eval()
+    try:
+        cfg = PointCloudConfig(**{**dcfg, "split": split, "mode": mode})
+        ds = PointCloudDataset(cfg)
+        loader = torch.utils.data.DataLoader(ds, batch_size=256, shuffle=False, num_workers=8)
+        X, y = [], []
+        for batch in loader:
+            if mode == "ssl":
+                xb, _, yb = batch   # (v1, v2, label) — use first augmented view
+            else:
+                xb, yb = batch
+            X.append(encoder.represent(xb.to(device)).cpu().numpy())
+            y.append(np.asarray(yb))
+        return np.concatenate(X), np.concatenate(y)
+    finally:
+        encoder.train(was_training)
 
 
 # --------------------------------------------------------------------------- #
@@ -151,8 +161,8 @@ def run(
 
     eval_data = OmegaConf.create(OmegaConf.to_container(getattr(cfg, "data", {}), resolve=True))
     dcfg = OmegaConf.to_container(OmegaConf.merge(train_cfg.data, eval_data), resolve=True)
-    Xtr, ytr = extract_features(encoder, "train", dcfg, device)
-    Xte, yte = extract_features(encoder, "test", dcfg, device)
+    Xtr, ytr = extract_features(encoder, "train", dcfg, device, mode="supervised")
+    Xte, yte = extract_features(encoder, "test", dcfg, device, mode="supervised")
     n_classes = int(getattr(cfg, "n_classes", dcfg["n_classes"]))
     metrics = probe(Xtr, ytr, Xte, yte, n_classes)
     
@@ -164,6 +174,15 @@ def run(
     
     # Merge metrics with random baseline prefixed
     metrics_with_baseline = {**metrics, **{f"random_{k}": v for k, v in metrics_random.items()}}
+
+    # Rotated probe: train features are canonical, test features use the training
+    # rotation augmentation. This reveals whether the model is actually rotation-invariant.
+    rotate = dcfg.get("rotate", "none")
+    if rotate != "none":
+        Xte_rot, yte_rot = extract_features(encoder, "test", dcfg, device, mode="ssl")
+        metrics_rot = probe(Xtr, ytr, Xte_rot, yte_rot, n_classes)
+        metrics["rotated_accuracy"] = metrics_rot["accuracy"]
+        metrics["rotated_gap"] = metrics_rot["gap"]
 
     own_wandb_run = None
     if wandb_run is None:
