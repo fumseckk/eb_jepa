@@ -19,6 +19,15 @@ from eb_jepa.datasets.pointcloud.dataset import PointCloudConfig, PointCloudData
 from examples.pointcloud.main import build_encoder
 from eb_jepa.training_utils import setup_wandb
 
+MODELNET40_CLASSES = [
+    "airplane", "bathtub", "bed", "bench", "bookshelf", "bottle", "bowl", "car",
+    "chair", "cone", "cup", "curtain", "desk", "door", "dresser", "flower_pot",
+    "glass_box", "guitar", "keyboard", "lamp", "laptop", "mantel", "monitor",
+    "night_stand", "person", "piano", "plant", "radio", "range_hood", "sink",
+    "sofa", "stairs", "stool", "table", "tent", "toilet", "tv_stand", "vase",
+    "wardrobe", "xbox",
+]
+
 
 def build_random_encoder(out_dim, device):
     """Build an untrained (random weight) encoder for baseline comparison.
@@ -98,6 +107,7 @@ def probe(Xtr, ytr, Xte, yte, n_classes):
 
     chance = 100.0 / float(n_classes)
 
+    preds = None
     try:
         from sklearn.linear_model import LogisticRegression
         clf = LogisticRegression(
@@ -107,7 +117,8 @@ def probe(Xtr, ytr, Xte, yte, n_classes):
             n_jobs=1,
         )
         clf.fit(Xtr, ytr)
-        acc = float(clf.score(Xte, yte) * 100.0)
+        preds = clf.predict(Xte)
+        acc = float((preds == yte).mean() * 100.0)
     except Exception:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         Xtr_t = torch.from_numpy(Xtr).to(device)
@@ -128,10 +139,33 @@ def probe(Xtr, ytr, Xte, yte, n_classes):
 
         opt.step(closure)
         with torch.no_grad():
-            preds = model(Xte_t).argmax(dim=1)
-            acc = float((preds == yte_t).float().mean().item() * 100.0)
+            preds_t = model(Xte_t).argmax(dim=1)
+            preds = preds_t.cpu().numpy()
+            acc = float((preds == yte).mean() * 100.0)
 
-    return {"accuracy": acc, "chance": chance, "gap": acc - chance}
+    per_class_acc = []
+    for c in range(n_classes):
+        mask = yte == c
+        if mask.sum() > 0:
+            per_class_acc.append(float((preds[mask] == yte[mask]).mean() * 100.0))
+        else:
+            per_class_acc.append(float("nan"))
+
+    return {"accuracy": acc, "chance": chance, "gap": acc - chance, "per_class_acc": per_class_acc}
+
+
+def export_latents(encoder, dcfg, device, output_path):
+    """Save test-set latent representations to a .npz file for offline t-SNE.
+
+    The saved file contains:
+      features : float32 array [N, D]  — encoder outputs
+      labels   : int64 array  [N]      — class indices (0-39 for ModelNet40)
+    """
+    X, y = extract_features(encoder, "test", dcfg, device, mode="supervised")
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(str(output_path), features=X.astype(np.float32), labels=y.astype(np.int64))
+    print(f"[pointcloud] latents saved → {output_path}", flush=True)
 
 
 def run(

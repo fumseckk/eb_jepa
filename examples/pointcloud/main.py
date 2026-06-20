@@ -229,7 +229,7 @@ def evaluate_ssl(ssl, loader, device):
 
 @torch.no_grad()
 def evaluate_probe(encoder, cfg, device):
-    from examples.pointcloud.eval import extract_features, probe, build_random_encoder
+    from examples.pointcloud.eval import extract_features, probe, build_random_encoder, MODELNET40_CLASSES  # noqa: F401
 
     dcfg = PointCloudConfig(**OmegaConf.to_container(cfg.data, resolve=True))
     dcfg_dict = asdict(dcfg)
@@ -296,9 +296,10 @@ def run(fname="examples/pointcloud/cfgs/train.yaml", cfg=None, folder=None, **ov
             opt.zero_grad(set_to_none=True)
             loss, logs = ssl.compute_loss(batch)
             loss.backward(); opt.step()
+        is_last_epoch = (epoch == cfg.optim.epochs - 1)
         eval_logs = None
         probe_logs = None
-        if eval_every > 0 and (epoch % eval_every == 0 or epoch == cfg.optim.epochs - 1):
+        if eval_every > 0 and (epoch % eval_every == 0 or is_last_epoch):
             eval_logs = evaluate_ssl(ssl, eval_loader, device)
             probe_logs = evaluate_probe(encoder, cfg, device)
         if wandb_run:
@@ -307,9 +308,19 @@ def run(fname="examples/pointcloud/cfgs/train.yaml", cfg=None, folder=None, **ov
             log_dict = {"epoch": epoch, **{f"train/{k}": v.item() if torch.is_tensor(v) else v for k, v in logs.items()}, "train/loss": loss.item()}
             if eval_logs is not None:
                 log_dict.update({f"eval/{k}": v for k, v in eval_logs.items()})
+            per_class_acc = None
             if probe_logs is not None:
+                per_class_acc = probe_logs.pop("per_class_acc", None)
                 log_dict.update({f"probe/{k}": v for k, v in probe_logs.items()})
             wandb.log(log_dict)
+            if per_class_acc is not None and is_last_epoch:
+                from examples.pointcloud.eval import MODELNET40_CLASSES
+                n_cls = len(per_class_acc)
+                names = MODELNET40_CLASSES[:n_cls] if n_cls <= len(MODELNET40_CLASSES) else [str(i) for i in range(n_cls)]
+                table = wandb.Table(columns=["class_id", "class_name", "accuracy (%)"])
+                for i, (name, acc_c) in enumerate(zip(names, per_class_acc)):
+                    table.add_data(i, name, round(acc_c, 2) if not (acc_c != acc_c) else None)
+                wandb.log({"probe/per_class_accuracy": table})
         print(f"[pointcloud:{cfg.data.rotate}] epoch {epoch} loss={loss.item():.4f} {logs}", flush=True)
         if eval_logs is not None:
             print(f"[pointcloud:{cfg.data.rotate}] epoch {epoch} eval={eval_logs}", flush=True)
@@ -319,6 +330,11 @@ def run(fname="examples/pointcloud/cfgs/train.yaml", cfg=None, folder=None, **ov
                     "cfg": OmegaConf.to_container(cfg, resolve=True)},
                    os.path.join(ckpt_dir, "latest.pth.tar"))
 
+    # Export test-set latents for offline t-SNE visualisation
+    from examples.pointcloud.eval import export_latents, MODELNET40_CLASSES
+    from dataclasses import asdict as _asdict
+    _dcfg = PointCloudConfig(**OmegaConf.to_container(cfg.data, resolve=True))
+    export_latents(encoder, _asdict(_dcfg), device, os.path.join(ckpt_dir, "latents_test.npz"))
 
     if wandb_run:
         import wandb

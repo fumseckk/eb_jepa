@@ -29,6 +29,6 @@ logging:
   wandb_group:
   eval_every: 5
 optim:
-  epochs: 60
+  epochs: 150
   lr: 1.0e-3
   weight_decay: 1.0e-6
