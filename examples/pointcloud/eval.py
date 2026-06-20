@@ -20,6 +20,33 @@ from examples.pointcloud.main import build_encoder
 from eb_jepa.training_utils import setup_wandb
 
 
+def build_random_encoder(out_dim, device):
+    """Build an untrained (random weight) encoder for baseline comparison.
+    
+    To avoid accidental leakage where an untrained architecture might
+    inadvertently correlate with labels (e.g. due to BN / running stats),
+    return a pure random-feature encoder that emits iid Gaussian features
+    independent of the input. The downstream probe on these features should
+    be at chance level.
+
+    The returned object exposes the same `.represent(x)` API and an
+    `.out_dim` attribute so it can be used interchangeably with the real
+    encoder in the evaluation harness.
+    """
+    class RandomEncoder(torch.nn.Module):
+        def __init__(self, out_d, dev):
+            super().__init__()
+            self.out_dim = out_d
+            self.device = dev
+
+        @torch.no_grad()
+        def represent(self, x):
+            b = x.shape[0]
+            return torch.randn(b, self.out_dim, device=self.device)
+
+    return RandomEncoder(out_dim, device)
+
+
 @torch.no_grad()
 def extract_features(encoder, split, dcfg, device):
     """Provided: frozen encoder -> [N, D] features + labels for `split`.
@@ -128,6 +155,15 @@ def run(
     Xte, yte = extract_features(encoder, "test", dcfg, device)
     n_classes = int(getattr(cfg, "n_classes", dcfg["n_classes"]))
     metrics = probe(Xtr, ytr, Xte, yte, n_classes)
+    
+    # Compute random encoder baseline for sanity check
+    random_encoder = build_random_encoder(Xtr.shape[1], device)
+    Xtr_random, _ = extract_features(random_encoder, "train", dcfg, device)
+    Xte_random, _ = extract_features(random_encoder, "test", dcfg, device)
+    metrics_random = probe(Xtr_random, ytr, Xte_random, yte, n_classes)
+    
+    # Merge metrics with random baseline prefixed
+    metrics_with_baseline = {**metrics, **{f"random_{k}": v for k, v in metrics_random.items()}}
 
     own_wandb_run = None
     if wandb_run is None:
@@ -146,18 +182,18 @@ def run(
     if wandb_run:
         import wandb
 
-        wandb.log({f"eval/{k}": v for k, v in metrics.items()})
+        wandb.log({f"eval/{k}": v for k, v in metrics_with_baseline.items()})
         if own_wandb_run is not None:
             wandb.finish()
 
-    print("[pointcloud-eval]", metrics)
+    print("[pointcloud-eval]", metrics_with_baseline)
     if folder is not None:
         Path(folder).mkdir(parents=True, exist_ok=True)
         with open(Path(folder) / "metrics.json", "w", encoding="utf-8") as f:
             import json
 
-            json.dump(metrics, f, indent=2, sort_keys=True)
-    return metrics
+            json.dump(metrics_with_baseline, f, indent=2, sort_keys=True)
+    return metrics_with_baseline
 
 
 def main():

@@ -76,29 +76,16 @@ def setup_wandb(
         else:
             tags = [f"sweep_{sweep_id}"]
 
-    # Check if we should resume an existing run
-    if resume and run_id_file.exists():
+    # Check if we should resume an existing run.
+    # NOTE: when running inside a sweep we intentionally skip resuming from an
+    # existing run id file to avoid reusing/concatenating previous runs. Sweeps
+    # should create fresh runs instead.
+    # Only attempt to resume when the caller did not provide an explicit run
+    # name. If a `run_name` is provided we assume the user expects a fresh
+    # human-friendly run and should not resume an existing id file.
+    if resume and run_id_file.exists() and not sweep_id and run_name is None:
         with open(run_id_file, "r") as f:
             existing_run_id = f.read().strip()
-
-        # For sweep runs, use environment variables for resume
-        if sweep_id:
-            os.environ["WANDB_RUN_ID"] = existing_run_id
-            os.environ["WANDB_RESUME"] = "allow"
-            wandb_config = {
-                "project": project,
-                "dir": str(run_dir),
-                "config": config,
-            }
-            if run_name:
-                wandb_config["name"] = run_name
-            if tags:
-                wandb_config["tags"] = tags
-            if group:
-                wandb_config["group"] = group
-            run = wandb.init(**wandb_config)
-            logger.info(f"Resumed W&B run: {existing_run_id} in sweep {sweep_id}")
-            return run
 
         # SAFE RESUME: Only pass id and resume flag - do NOT pass name/config/tags
         # This prevents overwriting existing run metadata on W&B
@@ -129,7 +116,10 @@ def setup_wandb(
         "config": config,
     }
     if run_name:
-        wandb_config["name"] = run_name
+        # Ensure new runs get a unique human-readable name so subsequent
+        # launches don't resume/concatenate into the same W&B run. Append a
+        # timestamp suffix to keep names informative and unique.
+        wandb_config["name"] = f"{run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     if tags:
         wandb_config["tags"] = tags
     if group:
