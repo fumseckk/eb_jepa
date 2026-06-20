@@ -76,7 +76,7 @@ def extract_features(encoder, split, dcfg, device, mode="supervised"):
 # --------------------------------------------------------------------------- #
 # PROBE + METRIC  — # TODO
 # --------------------------------------------------------------------------- #
-def probe(Xtr, ytr, Xte, yte, n_classes, return_predictions=False):
+def probe(Xtr, ytr, Xte, yte, n_classes):
     """TODO: fit a linear probe on the FROZEN train features (no leakage:
     standardize on train only) and score 40-way shape classification on the
     official test split. Return a metrics dict.
@@ -107,8 +107,7 @@ def probe(Xtr, ytr, Xte, yte, n_classes, return_predictions=False):
             n_jobs=1,
         )
         clf.fit(Xtr, ytr)
-        preds = clf.predict(Xte)
-        acc = float((preds == yte).mean() * 100.0)
+        acc = float(clf.score(Xte, yte) * 100.0)
     except Exception:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         Xtr_t = torch.from_numpy(Xtr).to(device)
@@ -131,47 +130,8 @@ def probe(Xtr, ytr, Xte, yte, n_classes, return_predictions=False):
         with torch.no_grad():
             preds = model(Xte_t).argmax(dim=1)
             acc = float((preds == yte_t).float().mean().item() * 100.0)
-            preds = preds.cpu().numpy()
 
-    metrics = {"accuracy": acc, "chance": chance, "gap": acc - chance}
-    if return_predictions:
-        return metrics, np.asarray(preds, dtype=np.int64)
-    return metrics
-
-
-def build_per_class_rows(y_true, y_pred, n_classes):
-    y_true = np.asarray(y_true, dtype=np.int64).reshape(-1)
-    y_pred = np.asarray(y_pred, dtype=np.int64).reshape(-1)
-
-    rows = []
-    for class_id in range(int(n_classes)):
-        mask = y_true == class_id
-        total = int(mask.sum())
-        correct = int((y_pred[mask] == class_id).sum()) if total > 0 else 0
-        accuracy = (100.0 * correct / total) if total > 0 else float("nan")
-        rows.append(
-            {
-                "class_id": class_id,
-                "accuracy": float(accuracy),
-                "correct": correct,
-                "total": total,
-            }
-        )
-    return rows
-
-
-def export_latents(path, latents_dict):
-        """Export latent embeddings + labels for downstream analysis.
-
-        Saves a compressed NPZ file with arrays such as:
-            - X_train, y_train
-            - X_test, y_test
-            - X_test_rotated, y_test_rotated (when available)
-        """
-        out_path = Path(path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(out_path, **latents_dict)
-        return out_path
+    return {"accuracy": acc, "chance": chance, "gap": acc - chance}
 
 
 def run(
@@ -204,50 +164,25 @@ def run(
     Xtr, ytr = extract_features(encoder, "train", dcfg, device, mode="supervised")
     Xte, yte = extract_features(encoder, "test", dcfg, device, mode="supervised")
     n_classes = int(getattr(cfg, "n_classes", dcfg["n_classes"]))
-    metrics, preds = probe(Xtr, ytr, Xte, yte, n_classes, return_predictions=True)
+    metrics = probe(Xtr, ytr, Xte, yte, n_classes)
     
     # Compute random encoder baseline for sanity check
     random_encoder = build_random_encoder(Xtr.shape[1], device)
     Xtr_random, _ = extract_features(random_encoder, "train", dcfg, device)
     Xte_random, _ = extract_features(random_encoder, "test", dcfg, device)
-    metrics_random, preds_random = probe(
-        Xtr_random, ytr, Xte_random, yte, n_classes, return_predictions=True
-    )
-
-    per_class_rows = build_per_class_rows(yte, preds, n_classes)
-    per_class_rows_random = build_per_class_rows(yte, preds_random, n_classes)
+    metrics_random = probe(Xtr_random, ytr, Xte_random, yte, n_classes)
     
+    # Merge metrics with random baseline prefixed
+    metrics_with_baseline = {**metrics, **{f"random_{k}": v for k, v in metrics_random.items()}}
+
     # Rotated probe: train features are canonical, test features use the training
     # rotation augmentation. This reveals whether the model is actually rotation-invariant.
     rotate = dcfg.get("rotate", "none")
-    Xte_rot = None
-    yte_rot = None
     if rotate != "none":
         Xte_rot, yte_rot = extract_features(encoder, "test", dcfg, device, mode="ssl")
         metrics_rot = probe(Xtr, ytr, Xte_rot, yte_rot, n_classes)
         metrics["rotated_accuracy"] = metrics_rot["accuracy"]
         metrics["rotated_gap"] = metrics_rot["gap"]
-
-    # Merge metrics with random baseline prefixed
-    metrics_with_baseline = {**metrics, **{f"random_{k}": v for k, v in metrics_random.items()}}
-
-    # Export latent embeddings for downstream data analysis
-    output_dir = Path(folder) if folder is not None else Path(ckpt).parent
-    rotate_name = str(rotate)
-    latents_path = output_dir / f"latents_{rotate_name}.npz"
-    latents_payload = {
-        "X_train": np.asarray(Xtr, dtype=np.float32),
-        "y_train": np.asarray(ytr, dtype=np.int64),
-        "X_test": np.asarray(Xte, dtype=np.float32),
-        "y_test": np.asarray(yte, dtype=np.int64),
-        "X_train_random": np.asarray(Xtr_random, dtype=np.float32),
-        "X_test_random": np.asarray(Xte_random, dtype=np.float32),
-    }
-    if Xte_rot is not None and yte_rot is not None:
-        latents_payload["X_test_rotated"] = np.asarray(Xte_rot, dtype=np.float32)
-        latents_payload["y_test_rotated"] = np.asarray(yte_rot, dtype=np.int64)
-    latents_path = export_latents(latents_path, latents_payload)
-    metrics_with_baseline["latents_path"] = str(latents_path)
 
     own_wandb_run = None
     if wandb_run is None:
@@ -266,32 +201,7 @@ def run(
     if wandb_run:
         import wandb
 
-        per_class_table = wandb.Table(
-            columns=[
-                "class_id",
-                "accuracy",
-                "random_accuracy",
-                "correct",
-                "total",
-            ]
-        )
-        for row, row_random in zip(per_class_rows, per_class_rows_random):
-            per_class_table.add_data(
-                row["class_id"],
-                row["accuracy"],
-                row_random["accuracy"],
-                row["correct"],
-                row["total"],
-            )
-
-        wandb.log(
-            {
-                **{f"eval/{k}": v for k, v in metrics_with_baseline.items()},
-                "eval/per_class_accuracy": per_class_table,
-            }
-        )
-        if hasattr(wandb, "save"):
-            wandb.save(str(latents_path), base_path=str(latents_path.parent))
+        wandb.log({f"eval/{k}": v for k, v in metrics_with_baseline.items()})
         if own_wandb_run is not None:
             wandb.finish()
 
