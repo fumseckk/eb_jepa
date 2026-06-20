@@ -1,13 +1,17 @@
-"""PointCloud — Point-JEPA SSL pretraining (masked predictive learning).
+"""PointCloud — Multi-view Point-JEPA (predictive learning with rotation invariance).
 
-Research question: can a masked predictive JEPA objective learn a rotation-invariant
+Research question: can a multi-view masked predictive objective learn a rotation-invariant
 shape representation on point clouds, and how does probe accuracy degrade as we
 demand more rotation invariance (none -> z -> SO(3))?
 
-The objective is Point-JEPA: mask random patches, encode visible (context) patches
-with a student encoder, use a teacher (EMA) to generate targets from unmasked regions,
-and train a predictor to reconstruct target embeddings from context. The student and
-teacher share weights via EMA.
+The objective is Multi-view JEPA: take two independent augmented views of the same shape
+with different rotations. Mask patches in view1 (student's context), keep view2 fully
+visible (teacher target). The student encodes unmasked patches of view1 and predicts
+the teacher's encoding of the SAME patches but from the differently-rotated view2.
+This forces rotation invariance: the student must learn which features are invariant
+across rotations to predict the rotated view from the unrotated one.
+
+The student and teacher share weights via EMA, predictor maps context -> target embeddings.
 
 Run:  python -m examples.pointcloud.main --fname examples/pointcloud/cfgs/train.yaml
 """
@@ -224,10 +228,20 @@ def build_encoder(cfg):
 # 2) SSL OBJECTIVE  — Point-JEPA
 # --------------------------------------------------------------------------- #
 def build_ssl(encoder, cfg):
-    """Point-JEPA: masked predictive learning with teacher EMA and predictor.
+    """Multi-view Point-JEPA: masked predictive learning with rotation invariance.
 
-    Returns an nn.Module with compute_loss(tokenized_data) -> (loss, logs).
-    Expects input: (tokens [B,T,D], centers [B,T,3])
+    Expects two augmented views of the same point cloud with different rotations.
+    View1 (student): patches are masked, only context visible
+    View2 (teacher): all patches visible, via EMA copy
+    Student predicts teacher's encoding of the SAME patches from different rotation,
+    forcing learned features to be rotation-invariant.
+
+    Args:
+        encoder: PatchEncoder (student backbone)
+        cfg: config with predictor_depth, predictor_heads, num_targets, target_ratio, etc.
+
+    Returns:
+        PointJEPA module with compute_loss(tokens1, centers1, tokens2, centers2)
     """
     from examples.pointcloud.jepa_modules import EMA, TargetSampler, ContextSampler, Predictor
 
@@ -269,44 +283,54 @@ def build_ssl(encoder, cfg):
 
         def compute_loss(self, batch):
             """
+            Multi-view JEPA for rotation invariance.
+
             Args:
-                batch: (tokens [B,T,D], centers [B,T,3])
+                batch: (tokens1, centers1, tokens2, centers2) — two views
+                  tokens1 [B,T,D]: view1 (student, will be masked)
+                  centers1 [B,T,3]: view1 center positions
+                  tokens2 [B,T,D]: view2 (teacher target)
+                  centers2 [B,T,3]: view2 center positions
 
             Returns:
                 loss, logs dict
             """
-            if isinstance(batch, (tuple, list)):
-                tokens, centers = batch[0], batch[1]
+            if isinstance(batch, (tuple, list)) and len(batch) == 4:
+                tokens1, centers1, tokens2, centers2 = batch
             else:
-                tokens, centers = batch['tokens'], batch['centers']
+                raise ValueError(f"Expected 4-tuple (tokens1, centers1, tokens2, centers2), got {type(batch)}")
 
-            B, T, D = tokens.shape
+            B, T, D = tokens1.shape
 
-            # Sample which patches are targets (to be masked)
-            target_tokens_list, target_indices_list = self.target_sampler(tokens)
+            # Sample which patches are targets to be masked in view1
+            target_tokens_list, target_indices_list = self.target_sampler(tokens1)
 
-            # Sample context patches (unmasked, visible)
-            context_tokens = self.context_sampler(tokens, target_indices_list)  # [B, n_ctx, D]
+            # Sample context patches (unmasked) in view1
+            context_tokens = self.context_sampler(tokens1, target_indices_list)  # [B, n_ctx, D]
 
-            # Encode context with student
-            context_pos = self.pos_embed(centers[:, :context_tokens.shape[1]])
-            context_features = self.encode_tokens(context_tokens, centers[:, :context_tokens.shape[1]], self.student)
+            # Encode context (unmasked patches of view1) with student
+            context_pos = self.pos_embed(centers1[:, :context_tokens.shape[1]])
+            context_features = self.encode_tokens(context_tokens, centers1[:, :context_tokens.shape[1]], self.student)
 
-            # Generate targets with teacher (no grad)
+            # Generate targets from view2 with teacher (no grad)
+            # Teacher sees all patches of view2 (different rotation from view1)
             with torch.no_grad():
-                teacher_features = self.encode_tokens(tokens, centers, self.teacher.ema_model)
+                teacher_features_v2 = self.encode_tokens(tokens2, centers2, self.teacher.ema_model)
 
-            # For each target set, compute loss
+            # Match target indices from view1 to view2 (same patch positions, different rotations)
             loss_total = 0.0
             for m in range(len(target_indices_list)):
-                target_idx = target_indices_list[m]  # indices of targets
-                target_feat = teacher_features[:, target_idx]  # [B, n_tgt, D]
-                target_pos = self.pos_embed(centers[:, target_idx])  # [B, n_tgt, D]
+                target_idx = target_indices_list[m]  # which patches of view1 were masked
 
-                # Predict target embeddings from context
+                # Get teacher's encoding of the SAME patches but from view2
+                # (since both views are tokenized identically, patch indices align)
+                target_feat = teacher_features_v2[:, target_idx]  # [B, n_tgt, D]
+                target_pos = self.pos_embed(centers2[:, target_idx])  # [B, n_tgt, D]
+
+                # Predict view2's patches from view1's context
                 predicted = self.predictor(context_features, context_pos, target_pos)  # [B, n_tgt, D]
 
-                # Smooth L1 loss
+                # Smooth L1 loss: student predicts teacher's rotated view
                 loss = self.loss_func(predicted, target_feat.detach())
                 loss_total = loss_total + loss
 
@@ -330,12 +354,15 @@ def evaluate_ssl(ssl, loader, device):
         # batch = (v1, v2, label) from SSL dataset mode
         v1, v2, *_ = batch
         v1 = v1.to(device)
+        v2 = v2.to(device)
 
-        # Tokenize
-        xyz = v1.transpose(1, 2)  # [B, N, 3]
-        tokens, centers = ssl.student.tokenize(xyz)
+        # Tokenize both views
+        xyz1 = v1.transpose(1, 2)  # [B, N, 3]
+        xyz2 = v2.transpose(1, 2)  # [B, N, 3]
+        tokens1, centers1 = ssl.student.tokenize(xyz1)
+        tokens2, centers2 = ssl.student.tokenize(xyz2)
 
-        loss, logs = ssl.compute_loss((tokens, centers))
+        loss, logs = ssl.compute_loss((tokens1, centers1, tokens2, centers2))
         count += 1
         totals["loss"] = totals.get("loss", 0.0) + float(loss.item())
         for k, v in logs.items():
@@ -411,18 +438,23 @@ def run(fname="examples/pointcloud/cfgs/train.yaml", cfg=None, folder=None, **ov
         ssl.train()
         for batch in loader:
             # batch = (v1, v2, label) from SSL dataset mode
+            # v1, v2 are TWO INDEPENDENT augmented views of the same point cloud
             v1, v2, *_ = batch
             v1 = v1.to(device)
+            v2 = v2.to(device)
 
-            # Tokenize the augmented point cloud
-            # v1 is [B, 3, N]; convert to [B, N, 3] for tokenization
-            xyz = v1.transpose(1, 2)  # [B, N, 3]
+            # Multi-view JEPA: v1 (student, masked) predicts v2 (teacher, unmasked)
+            # This forces rotation invariance since v1 and v2 have different rotations
+            xyz1 = v1.transpose(1, 2)  # [B, N, 3]
+            xyz2 = v2.transpose(1, 2)  # [B, N, 3]
+
             with torch.no_grad():
-                tokens, centers = encoder.tokenize(xyz)
+                tokens1, centers1 = encoder.tokenize(xyz1)
+                tokens2, centers2 = encoder.tokenize(xyz2)
 
-            # JEPA forward pass (includes masking, context/target sampling, prediction)
+            # JEPA forward pass: student encodes masked v1, predicts unmasked v2 via teacher
             opt.zero_grad(set_to_none=True)
-            loss, logs = ssl.compute_loss((tokens, centers))
+            loss, logs = ssl.compute_loss((tokens1, centers1, tokens2, centers2))
             loss.backward()
             opt.step()
 
