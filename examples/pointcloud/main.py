@@ -1,18 +1,13 @@
-"""PointCloud — SSL pretraining entrypoint (view-invariant 3D shape SSL).
+"""PointCloud — Point-JEPA SSL pretraining (masked predictive learning).
 
-Research question: can a two-view SSL objective learn a VIEW-INVARIANT shape
-representation on an unordered/irregular modality (point clouds), and how does the
-linear-probe accuracy degrade as we demand more rotation invariance (none -> z ->
-SO(3))?
+Research question: can a masked predictive JEPA objective learn a rotation-invariant
+shape representation on point clouds, and how does probe accuracy degrade as we
+demand more rotation invariance (none -> z -> SO(3))?
 
-Point clouds have no temporal frames, so the objective is a two-view VICReg (the
-image-JEPA / audio / EEG recipe), NOT a predictive JEPA. Two independent augmented
-samplings + rotations of the same object are the two views.
-
-The DATA + TRAINING LOOP are provided. The two modelling pieces you implement are
-marked `# TODO` below — that is the whole point of the track:
-  1. the PointNet encoder over [B, 3, N]
-  2. the two-view VICReg objective
+The objective is Point-JEPA: mask random patches, encode visible (context) patches
+with a student encoder, use a teacher (EMA) to generate targets from unmasked regions,
+and train a predictor to reconstruct target embeddings from context. The student and
+teacher share weights via EMA.
 
 Run:  python -m examples.pointcloud.main --fname examples/pointcloud/cfgs/train.yaml
 """
@@ -36,16 +31,70 @@ from eb_jepa.training_utils import setup_wandb
 # 1) ENCODER  — # TODO
 # --------------------------------------------------------------------------- #
 def build_encoder(cfg):
-    in_channels = int(getattr(cfg, "in_channels", 3))
-    out_dim     = int(getattr(cfg, "out_dim", 1024))
-    n_centers   = int(getattr(cfg, "n_centers", 64))
-    k_neighbors = int(getattr(cfg, "k_neighbors", 32))
-    d_model     = int(getattr(cfg, "d_model", 384))
-    n_heads     = int(getattr(cfg, "n_heads", 6))
-    n_layers    = int(getattr(cfg, "n_layers", 12))
+    in_channels     = int(getattr(cfg, "in_channels", 3))
+    out_dim         = int(getattr(cfg, "out_dim", 1024))
+    n_centers       = int(getattr(cfg, "n_centers", 64))
+    k_neighbors     = int(getattr(cfg, "k_neighbors", 32))
+    d_model         = int(getattr(cfg, "d_model", 384))
+    n_heads         = int(getattr(cfg, "n_heads", 6))
+    n_layers        = int(getattr(cfg, "n_layers", 12))
+    drop_path_rate  = float(getattr(cfg, "drop_path_rate", 0.25))
+    attn_dropout    = float(getattr(cfg, "attn_dropout", 0.05))
 
+    # Stochastic depth schedule (linearly increasing per layer, as in the paper)
+    dpr = [x.item() for x in torch.linspace(0, drop_path_rate, n_layers)]
+
+    # ------------------------------------------------------------------ #
+    # Drop-path (stochastic depth) — scales residual to zero for a random
+    # subset of samples in each batch, independent per layer.
+    # ------------------------------------------------------------------ #
+    class DropPath(nn.Module):
+        def __init__(self, p: float):
+            super().__init__()
+            self.p = p
+
+        def forward(self, x):
+            if self.p == 0. or not self.training:
+                return x
+            keep = 1 - self.p
+            mask = torch.rand(x.shape[0], *([1] * (x.ndim - 1)), device=x.device) < keep
+            return x * mask / keep
+
+    # ------------------------------------------------------------------ #
+    # Transformer block with per-layer positional encoding injected into
+    # Q and K (following Point-JEPA / BEiT-style "pos at every layer").
+    # ------------------------------------------------------------------ #
+    class TransformerBlock(nn.Module):
+        def __init__(self, drop_path_p: float):
+            super().__init__()
+            self.norm1   = nn.LayerNorm(d_model)
+            self.attn    = nn.MultiheadAttention(
+                d_model, n_heads, dropout=attn_dropout, batch_first=True
+            )
+            self.dp1     = DropPath(drop_path_p)
+            self.norm2   = nn.LayerNorm(d_model)
+            self.mlp     = nn.Sequential(
+                nn.Linear(d_model, d_model * 4),
+                nn.GELU(),
+                nn.Linear(d_model * 4, d_model),
+            )
+            self.dp2     = DropPath(drop_path_p)
+
+        def forward(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+            # Inject positional encoding into Q and K at every layer
+            xn  = self.norm1(x)
+            q   = xn + pos
+            k   = xn + pos
+            v   = xn
+            out, _ = self.attn(q, k, v)
+            x   = x + self.dp1(out)
+            x   = x + self.dp2(self.mlp(self.norm2(x)))
+            return x
+
+    # ------------------------------------------------------------------ #
+    # Mini PointNet: tokenises one local patch [B·C, 3, k] → [B·C, d_model]
+    # ------------------------------------------------------------------ #
     class MiniPointNet(nn.Module):
-        """Tokenise un patch [B·C, 3, k] → patch embedding [B·C, d_model]."""
         def __init__(self):
             super().__init__()
             self.mlp1 = nn.Sequential(
@@ -66,13 +115,15 @@ def build_encoder(cfg):
             )
 
         def forward(self, x):
-            # x : [B·C, 3, k]
-            h = self.mlp1(x)                        # [B·C, 64, k]
+            h = self.mlp1(x)                                    # [B·C, 64, k]
             g = h.max(dim=2, keepdim=True).values.expand_as(h)
-            h = torch.cat([h, g], dim=1)            # [B·C, 128, k]
-            h = self.mlp2(h)                        # [B·C, d_model, k]
-            return h.max(dim=2).values              # [B·C, d_model]
+            h = torch.cat([h, g], dim=1)                        # [B·C, 128, k]
+            h = self.mlp2(h)                                    # [B·C, d_model, k]
+            return h.max(dim=2).values                          # [B·C, d_model]
 
+    # ------------------------------------------------------------------ #
+    # Full encoder
+    # ------------------------------------------------------------------ #
     class PatchEncoder(nn.Module):
         def __init__(self):
             super().__init__()
@@ -81,34 +132,43 @@ def build_encoder(cfg):
             self.k_neighbors = k_neighbors
             self.d_model     = d_model
 
-            # Tokenisation
-            self.mini_pnet = MiniPointNet()
+            self.mini_pnet   = MiniPointNet()
 
-            # Encodage positionnel (depuis les centres 3D → d_model)
-            self.pos_embed = nn.Sequential(
+            # GELU positional encoding (as in Point-JEPA)
+            self.pos_embed   = nn.Sequential(
                 nn.Linear(3, 128),
-                nn.ReLU(inplace=True),
+                nn.GELU(),
                 nn.Linear(128, d_model),
             )
 
-            # Transformer encoder
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=d_model,
-                nhead=n_heads,
-                dim_feedforward=d_model * 4,
-                dropout=0.0,
-                batch_first=True,
-            )
-            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+            self.blocks      = nn.ModuleList([
+                TransformerBlock(dpr[i]) for i in range(n_layers)
+            ])
+            self.norm        = nn.LayerNorm(d_model)
 
-            # Projection finale vers out_dim si d_model != out_dim
-            self.proj = nn.Linear(d_model, out_dim) if d_model != out_dim else nn.Identity()
+            # Global feature is max‖mean concat → 2·d_model; project to out_dim
+            self.proj        = nn.Linear(2 * d_model, out_dim)
+
+        def tokenize(self, xyz):
+            """Extract patches and tokenize: xyz [B, N, 3] → tokens [B, C, D], centers [B, C, 3]."""
+            B        = xyz.shape[0]
+            C, k     = self.n_centers, self.k_neighbors
+            ctr_idx  = self._fps(xyz, C)
+            centers  = xyz[torch.arange(B, device=xyz.device).unsqueeze(1), ctr_idx]
+            nn_idx   = self._knn(xyz, centers, k)
+            idx_exp  = nn_idx.unsqueeze(-1).expand(-1, -1, -1, 3)
+            patches  = xyz.unsqueeze(1).expand(-1, C, -1, -1).gather(2, idx_exp)
+            patches  = patches - centers.unsqueeze(2)           # local coords
+
+            pts    = patches.view(B * C, k, 3).transpose(1, 2)  # [B·C, 3, k]
+            tokens = self.mini_pnet(pts).view(B, C, self.d_model)  # [B, C, d_model]
+            return tokens, centers
 
         @staticmethod
         def _fps(xyz, n):
-            """xyz : [B, N, 3] → idx : [B, n]"""
-            B, N, _ = xyz.shape
-            device  = xyz.device
+            """Farthest-point sampling: xyz [B, N, 3] → idx [B, n]."""
+            B, N, _  = xyz.shape
+            device   = xyz.device
             idx      = torch.zeros(B, n, dtype=torch.long, device=device)
             dist     = torch.full((B, N), float("inf"), device=device)
             farthest = torch.randint(0, N, (B,), device=device)
@@ -122,51 +182,38 @@ def build_encoder(cfg):
 
         @staticmethod
         def _knn(xyz, centers, k):
-            """xyz : [B,N,3], centers : [B,C,3] → [B,C,k]"""
-            d = ((xyz.unsqueeze(1) - centers.unsqueeze(2)) ** 2).sum(-1)  # [B,C,N]
-            return d.topk(k, dim=2, largest=False).indices                  # [B,C,k]
+            """xyz [B,N,3], centers [B,C,3] → indices [B,C,k]."""
+            d = ((xyz.unsqueeze(1) - centers.unsqueeze(2)) ** 2).sum(-1)
+            return d.topk(k, dim=2, largest=False).indices
 
         def _extract_patches(self, xyz):
-            """xyz : [B, N, 3] → patches [B, C, k, 3], centres [B, C, 3]"""
-            B = xyz.shape[0]
-            C, k = self.n_centers, self.k_neighbors
-            ctr_idx = self._fps(xyz, C)                                      # [B, C]
-            centers = xyz[torch.arange(B, device=xyz.device).unsqueeze(1),
-                          ctr_idx]                                            # [B, C, 3]
-            nn_idx  = self._knn(xyz, centers, k)                             # [B, C, k]
-            idx_exp = nn_idx.unsqueeze(-1).expand(-1, -1, -1, 3)
-            patches = xyz.unsqueeze(1).expand(-1, C, -1, -1).gather(2, idx_exp)
-            patches = patches - centers.unsqueeze(2)                         # normalisation locale
+            """xyz [B, N, 3] → patches [B, C, k, 3], centers [B, C, 3]."""
+            B        = xyz.shape[0]
+            C, k     = self.n_centers, self.k_neighbors
+            ctr_idx  = self._fps(xyz, C)
+            centers  = xyz[torch.arange(B, device=xyz.device).unsqueeze(1), ctr_idx]
+            nn_idx   = self._knn(xyz, centers, k)
+            idx_exp  = nn_idx.unsqueeze(-1).expand(-1, -1, -1, 3)
+            patches  = xyz.unsqueeze(1).expand(-1, C, -1, -1).gather(2, idx_exp)
+            patches  = patches - centers.unsqueeze(2)           # local coords
             return patches, centers
 
         def represent(self, x):
-            """x : [B, 3, N] → [B, out_dim]"""
-            if x.shape[1] == in_channels:
-                xyz = x.transpose(1, 2)   # [B, N, 3]
-            else:
-                xyz = x
+            """x [B, 3, N] → [B, out_dim]. Encodes all tokens (not masked)."""
+            xyz = x.transpose(1, 2) if x.shape[1] == in_channels else x  # [B, N, 3]
+            tokens, centers = self.tokenize(xyz)                 # [B, C, d_model], [B, C, 3]
+            pos = self.pos_embed(centers)                        # [B, C, d_model]
 
-            B = xyz.shape[0]
-            C, k = self.n_centers, self.k_neighbors
+            # Transformer with positional encoding injected at every layer
+            for block in self.blocks:
+                tokens = block(tokens, pos)
+            tokens = self.norm(tokens)                           # [B, C, d_model]
 
-            patches, centers = self._extract_patches(xyz)  # [B, C, k, 3], [B, C, 3]
-
-            # Tokenisation via mini PointNet
-            pts = patches.view(B * C, k, 3).transpose(1, 2)  # [B·C, 3, k]
-            tokens = self.mini_pnet(pts)                       # [B·C, d_model]
-            tokens = tokens.view(B, C, self.d_model)          # [B, C, d_model]
-
-            # Encodage positionnel des centres
-            pos = self.pos_embed(centers)                      # [B, C, d_model]
-            tokens = tokens + pos
-
-            # Transformer : interaction entre patches
-            tokens = self.transformer(tokens)                  # [B, C, d_model]
-
-            # Agrégation globale
-            global_feat = tokens.max(dim=1).values             # [B, d_model]
-
-            return self.proj(global_feat)                      # [B, out_dim]
+            # Global feature: max + mean (following Point-JEPA svm_validation)
+            global_feat = torch.cat(
+                [tokens.max(dim=1).values, tokens.mean(dim=1)], dim=-1
+            )                                                    # [B, 2·d_model]
+            return self.proj(global_feat)                        # [B, out_dim]
 
         def forward(self, x):
             return self.represent(x)
@@ -174,63 +221,121 @@ def build_encoder(cfg):
     return PatchEncoder()
 
 # --------------------------------------------------------------------------- #
-# 2) SSL OBJECTIVE  — # TODO
+# 2) SSL OBJECTIVE  — Point-JEPA
 # --------------------------------------------------------------------------- #
 def build_ssl(encoder, cfg):
-    """TODO: return an nn.Module exposing `compute_loss(batch) -> (loss, logs)`,
-    where `batch = (v1, v2, label)` are the two augmented views (label unused for
-    SSL).
+    """Point-JEPA: masked predictive learning with teacher EMA and predictor.
 
-    Build a two-view VICReg head:
-      v1, v2 -> encoder.represent -> eb_jepa.architectures.Projector ->
-      eb_jepa.losses.VICRegLoss(std_coeff, cov_coeff) on the two projections.
-    The variance + covariance terms are the anti-collapse ingredient; the
-    invariance (MSE) term is what pulls the two views of the same object together
-    and makes the representation VIEW-INVARIANT. Return the scalar loss and a logs
-    dict (e.g. the VICRegLoss component breakdown)."""
-    projector_spec = getattr(cfg, "projector", None) or getattr(cfg, "proj", None)
-    if projector_spec is None:
-        projector_spec = f"{encoder.out_dim}-2048-2048"
-    elif isinstance(projector_spec, (list, tuple)):
-        projector_spec = "-".join(str(int(v)) for v in projector_spec)
-        if not projector_spec.startswith(f"{encoder.out_dim}-"):
-            projector_spec = f"{encoder.out_dim}-{projector_spec}"
-    else:
-        projector_spec = str(projector_spec)
-        if not projector_spec.startswith(f"{encoder.out_dim}-"):
-            projector_spec = f"{encoder.out_dim}-{projector_spec}"
+    Returns an nn.Module with compute_loss(tokenized_data) -> (loss, logs).
+    Expects input: (tokens [B,T,D], centers [B,T,3])
+    """
+    from examples.pointcloud.jepa_modules import EMA, TargetSampler, ContextSampler, Predictor
 
-    std_coeff = float(getattr(cfg, "std_coeff", 25.0))
-    cov_coeff = float(getattr(cfg, "cov_coeff", 1.0))
+    predictor_depth = int(getattr(cfg, "predictor_depth", 6))
+    predictor_heads = int(getattr(cfg, "predictor_heads", 6))
+    num_targets = int(getattr(cfg, "num_targets", 4))
+    target_ratio = tuple(getattr(cfg, "target_ratio", (0.15, 0.2)))
+    context_ratio = tuple(getattr(cfg, "context_ratio", (0.4, 0.75)))
+    loss_beta = float(getattr(cfg, "loss_beta", 2.0))
+    ema_tau_min = float(getattr(cfg, "ema_tau_min", 0.99))
+    ema_tau_max = float(getattr(cfg, "ema_tau_max", 0.9998))
 
-    class TwoViewVICReg(nn.Module):
-        def __init__(self, enc):
+    class PointJEPA(nn.Module):
+        def __init__(self, student_encoder):
             super().__init__()
-            from eb_jepa.architectures import Projector
-            from eb_jepa.losses import VICRegLoss
+            self.student = student_encoder
+            self.teacher = EMA(student_encoder, tau_min=ema_tau_min, tau_max=ema_tau_max, tau_steps=10000)
+            self.predictor = Predictor(
+                embed_dim=encoder.d_model,
+                depth=predictor_depth,
+                num_heads=predictor_heads,
+            )
+            self.target_sampler = TargetSampler(num_targets=num_targets, target_ratio=target_ratio)
+            self.context_sampler = ContextSampler(context_ratio=context_ratio)
+            self.pos_embed = nn.Sequential(
+                nn.Linear(3, 128),
+                nn.GELU(),
+                nn.Linear(128, encoder.d_model),
+            )
+            self.loss_func = nn.SmoothL1Loss(beta=loss_beta)
 
-            self.encoder = enc
-            self.projector = Projector(projector_spec)
-            self.criterion = VICRegLoss(std_coeff=std_coeff, cov_coeff=cov_coeff)
+        def encode_tokens(self, tokens, centers, model):
+            """Encode tokenized patches: tokens [B,T,D], centers [B,T,3] -> features [B,T,D]."""
+            pos = self.pos_embed(centers)  # [B, T, D]
+            for block in model.blocks:
+                tokens = block(tokens, pos)
+            tokens = model.norm(tokens)
+            return tokens
 
         def compute_loss(self, batch):
-            v1, v2, *_ = batch
-            z1 = self.projector(self.encoder.represent(v1))
-            z2 = self.projector(self.encoder.represent(v2))
-            loss_dict = self.criterion(z1, z2)
-            return loss_dict["loss"], loss_dict
+            """
+            Args:
+                batch: (tokens [B,T,D], centers [B,T,3])
 
-    return TwoViewVICReg(encoder)
+            Returns:
+                loss, logs dict
+            """
+            if isinstance(batch, (tuple, list)):
+                tokens, centers = batch[0], batch[1]
+            else:
+                tokens, centers = batch['tokens'], batch['centers']
+
+            B, T, D = tokens.shape
+
+            # Sample which patches are targets (to be masked)
+            target_tokens_list, target_indices_list = self.target_sampler(tokens)
+
+            # Sample context patches (unmasked, visible)
+            context_tokens = self.context_sampler(tokens, target_indices_list)  # [B, n_ctx, D]
+
+            # Encode context with student
+            context_pos = self.pos_embed(centers[:, :context_tokens.shape[1]])
+            context_features = self.encode_tokens(context_tokens, centers[:, :context_tokens.shape[1]], self.student)
+
+            # Generate targets with teacher (no grad)
+            with torch.no_grad():
+                teacher_features = self.encode_tokens(tokens, centers, self.teacher.ema_model)
+
+            # For each target set, compute loss
+            loss_total = 0.0
+            for m in range(len(target_indices_list)):
+                target_idx = target_indices_list[m]  # indices of targets
+                target_feat = teacher_features[:, target_idx]  # [B, n_tgt, D]
+                target_pos = self.pos_embed(centers[:, target_idx])  # [B, n_tgt, D]
+
+                # Predict target embeddings from context
+                predicted = self.predictor(context_features, context_pos, target_pos)  # [B, n_tgt, D]
+
+                # Smooth L1 loss
+                loss = self.loss_func(predicted, target_feat.detach())
+                loss_total = loss_total + loss
+
+            loss_total = loss_total / max(len(target_indices_list), 1)
+            return loss_total, {"loss": loss_total}
+
+        def forward(self, batch):
+            return self.compute_loss(batch)
+
+    return PointJEPA(encoder)
 
 
 @torch.no_grad()
 def evaluate_ssl(ssl, loader, device):
     ssl.eval()
+    ssl.student.eval()
+    ssl.teacher.eval()
     totals = {}
     count = 0
     for batch in loader:
-        batch = batch.to(device) if torch.is_tensor(batch) else [b.to(device) for b in batch]
-        loss, logs = ssl.compute_loss(batch)
+        # batch = (v1, v2, label) from SSL dataset mode
+        v1, v2, *_ = batch
+        v1 = v1.to(device)
+
+        # Tokenize
+        xyz = v1.transpose(1, 2)  # [B, N, 3]
+        tokens, centers = ssl.student.tokenize(xyz)
+
+        loss, logs = ssl.compute_loss((tokens, centers))
         count += 1
         totals["loss"] = totals.get("loss", 0.0) + float(loss.item())
         for k, v in logs.items():
@@ -305,10 +410,25 @@ def run(fname="examples/pointcloud/cfgs/train.yaml", cfg=None, folder=None, **ov
     for epoch in range(cfg.optim.epochs):
         ssl.train()
         for batch in loader:
-            batch = batch.to(device) if torch.is_tensor(batch) else [b.to(device) for b in batch]
+            # batch = (v1, v2, label) from SSL dataset mode
+            v1, v2, *_ = batch
+            v1 = v1.to(device)
+
+            # Tokenize the augmented point cloud
+            # v1 is [B, 3, N]; convert to [B, N, 3] for tokenization
+            xyz = v1.transpose(1, 2)  # [B, N, 3]
+            with torch.no_grad():
+                tokens, centers = encoder.tokenize(xyz)
+
+            # JEPA forward pass (includes masking, context/target sampling, prediction)
             opt.zero_grad(set_to_none=True)
-            loss, logs = ssl.compute_loss(batch)
-            loss.backward(); opt.step()
+            loss, logs = ssl.compute_loss((tokens, centers))
+            loss.backward()
+            opt.step()
+
+            # Update teacher EMA
+            ssl.teacher.update()
+
         eval_logs = None
         probe_logs = None
         if eval_every > 0 and (epoch % eval_every == 0 or epoch == cfg.optim.epochs - 1):
