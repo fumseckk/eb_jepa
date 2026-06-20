@@ -153,21 +153,22 @@ def evaluate_probe(encoder, cfg, device):
     from examples.pointcloud.eval import extract_features, probe, build_random_encoder
 
     dcfg = PointCloudConfig(**OmegaConf.to_container(cfg.data, resolve=True))
-    dcfg.split = "train"
-    dcfg.mode = "supervised"
     dcfg_dict = asdict(dcfg)
-    Xtr, ytr = extract_features(encoder, "train", dcfg_dict, device)
-    Xte, yte = extract_features(encoder, "test", dcfg_dict, device)
-    metrics = probe(Xtr, ytr, Xte, yte, int(cfg.data.n_classes))
-    
-    # Add random encoder baseline
-    random_encoder = build_random_encoder(Xtr.shape[1], device)
-    Xtr_random, _ = extract_features(random_encoder, "train", dcfg_dict, device)
-    Xte_random, _ = extract_features(random_encoder, "test", dcfg_dict, device)
-    metrics_random = probe(Xtr_random, ytr, Xte_random, yte, int(cfg.data.n_classes))
-    
-    # Merge metrics with random baseline prefixed
-    return {**metrics, **{f"random_{k}": v for k, v in metrics_random.items()}}
+    n_classes = int(cfg.data.n_classes)
+
+    Xtr, ytr = extract_features(encoder, "train", dcfg_dict, device, mode="supervised")
+    Xte, yte = extract_features(encoder, "test", dcfg_dict, device, mode="supervised")
+    metrics = probe(Xtr, ytr, Xte, yte, n_classes)
+
+    # Rotated probe: canonical train features vs rotation-augmented test features.
+    # Exposes whether the model generalises across the training rotation setting.
+    if cfg.data.rotate != "none":
+        Xte_rot, yte_rot = extract_features(encoder, "test", dcfg_dict, device, mode="ssl")
+        metrics_rot = probe(Xtr, ytr, Xte_rot, yte_rot, n_classes)
+        metrics["rotated_accuracy"] = metrics_rot["accuracy"]
+        metrics["rotated_gap"] = metrics_rot["gap"]
+
+    return metrics
 
 
 # --------------------------------------------------------------------------- #
