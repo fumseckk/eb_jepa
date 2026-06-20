@@ -212,14 +212,7 @@ def run(fname="examples/pointcloud/cfgs/train.yaml", cfg=None, folder=None, **ov
     eval_every = int(cfg.logging.get("eval_every", 1))
     for epoch in range(cfg.optim.epochs):
         ssl.train()
-        print(f"[pointcloud:{cfg.data.rotate}] epoch {epoch} loss={loss.item():.4f} {logs}", flush=True)
-        if eval_logs is not None:
-            print(f"[pointcloud:{cfg.data.rotate}] epoch {epoch} eval={eval_logs}", flush=True)
-        if eval_every > 0 and (epoch % eval_every == 0 or epoch == cfg.optim.epochs - 1):
-            print(f"[pointcloud:{cfg.data.rotate}] epoch {epoch} probe={probe_logs}", flush=True)
-        torch.save({"epoch": epoch, "encoder": encoder.state_dict(),
-                    "cfg": OmegaConf.to_container(cfg, resolve=True)},
-                   os.path.join(ckpt_dir, "latest.pth.tar"))
+        
         for batch in loader:
             batch = batch.to(device) if torch.is_tensor(batch) else [b.to(device) for b in batch]
             opt.zero_grad(set_to_none=True)
@@ -238,6 +231,14 @@ def run(fname="examples/pointcloud/cfgs/train.yaml", cfg=None, folder=None, **ov
             if eval_every > 0 and (epoch % eval_every == 0 or epoch == cfg.optim.epochs - 1):
                 log_dict.update({f"probe/{k}": v for k, v in probe_logs.items()})
             wandb.log(log_dict)
+        print(f"[pointcloud:{cfg.data.rotate}] epoch {epoch} loss={loss.item():.4f} {logs}", flush=True)
+        if eval_logs is not None:
+            print(f"[pointcloud:{cfg.data.rotate}] epoch {epoch} eval={eval_logs}", flush=True)
+        if eval_every > 0 and (epoch % eval_every == 0 or epoch == cfg.optim.epochs - 1):
+            print(f"[pointcloud:{cfg.data.rotate}] epoch {epoch} probe={probe_logs}", flush=True)
+        torch.save({"epoch": epoch, "encoder": encoder.state_dict(),
+                    "cfg": OmegaConf.to_container(cfg, resolve=True)},
+                   os.path.join(ckpt_dir, "latest.pth.tar"))
         
 
     if wandb_run:
