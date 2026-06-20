@@ -160,6 +160,20 @@ def build_per_class_rows(y_true, y_pred, n_classes):
     return rows
 
 
+def export_latents(path, latents_dict):
+        """Export latent embeddings + labels for downstream analysis.
+
+        Saves a compressed NPZ file with arrays such as:
+            - X_train, y_train
+            - X_test, y_test
+            - X_test_rotated, y_test_rotated (when available)
+        """
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(out_path, **latents_dict)
+        return out_path
+
+
 def run(
     fname="examples/pointcloud/cfgs/eval.yaml",
     cfg=None,
@@ -206,6 +220,8 @@ def run(
     # Rotated probe: train features are canonical, test features use the training
     # rotation augmentation. This reveals whether the model is actually rotation-invariant.
     rotate = dcfg.get("rotate", "none")
+    Xte_rot = None
+    yte_rot = None
     if rotate != "none":
         Xte_rot, yte_rot = extract_features(encoder, "test", dcfg, device, mode="ssl")
         metrics_rot = probe(Xtr, ytr, Xte_rot, yte_rot, n_classes)
@@ -214,6 +230,24 @@ def run(
 
     # Merge metrics with random baseline prefixed
     metrics_with_baseline = {**metrics, **{f"random_{k}": v for k, v in metrics_random.items()}}
+
+    # Export latent embeddings for downstream data analysis
+    output_dir = Path(folder) if folder is not None else Path(ckpt).parent
+    rotate_name = str(rotate)
+    latents_path = output_dir / f"latents_{rotate_name}.npz"
+    latents_payload = {
+        "X_train": np.asarray(Xtr, dtype=np.float32),
+        "y_train": np.asarray(ytr, dtype=np.int64),
+        "X_test": np.asarray(Xte, dtype=np.float32),
+        "y_test": np.asarray(yte, dtype=np.int64),
+        "X_train_random": np.asarray(Xtr_random, dtype=np.float32),
+        "X_test_random": np.asarray(Xte_random, dtype=np.float32),
+    }
+    if Xte_rot is not None and yte_rot is not None:
+        latents_payload["X_test_rotated"] = np.asarray(Xte_rot, dtype=np.float32)
+        latents_payload["y_test_rotated"] = np.asarray(yte_rot, dtype=np.int64)
+    latents_path = export_latents(latents_path, latents_payload)
+    metrics_with_baseline["latents_path"] = str(latents_path)
 
     own_wandb_run = None
     if wandb_run is None:
@@ -256,6 +290,8 @@ def run(
                 "eval/per_class_accuracy": per_class_table,
             }
         )
+        if hasattr(wandb, "save"):
+            wandb.save(str(latents_path), base_path=str(latents_path.parent))
         if own_wandb_run is not None:
             wandb.finish()
 
