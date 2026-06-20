@@ -16,11 +16,13 @@ sweep:
   param_grid:
     data.rotate: [none, z, so3]
 model:
-  in_channels: 3        # (x, y, z)
-  out_dim: 1024         # PointNet global feature dim D
-  projector: 1024-2048-2048
-  std_coeff: 25.0
-  cov_coeff: 1.0
+  in_channels: 3
+  out_dim: 1024
+  n_centers: 64       # nb de patches (FPS)
+  k_neighbors: 32     # points par patch (KNN)
+  d_model: 384        # dim interne du Transformer
+  n_heads: 6          # têtes d'attention
+  n_layers: 12        # profondeur du Transformer
 logging:
   log_wandb: true
   wandb_group:
