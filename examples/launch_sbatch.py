@@ -155,6 +155,16 @@ EXAMPLE_CONFIGS = {
         "module": "examples.pointcloud.eval",
         "metric": "accuracy",
     },
+    "pointcloud_kpconvx": {
+        "config": "examples/pointcloud_kpconvx/cfgs/train.yaml",
+        "module": "examples.pointcloud_kpconvx.main",
+        "metric": "accuracy",
+    },
+    "pointcloud_kpconvx_eval": {
+        "config": "examples/pointcloud_kpconvx/cfgs/eval.yaml",
+        "module": "examples.pointcloud_kpconvx.eval",
+        "metric": "accuracy",
+    },
     "gray_scott": {
         "config": "examples/gray_scott/cfgs/train.yaml",
         "module": "examples.gray_scott.main",
@@ -460,7 +470,8 @@ if __name__ == "__main__":
         required=True,
         choices=["image_jepa", "video_jepa", "ac_video_jepa", "maze",
                  "fintime", "ltsf", "eeg", "audio", "pointcloud",
-                 "pointcloud_eval", "gray_scott",
+                 "pointcloud_eval", "pointcloud_kpconvx",
+                 "pointcloud_kpconvx_eval", "gray_scott",
                  "intuitive_physics","factors_of_variation"],
         help="Which example to run",
     )
