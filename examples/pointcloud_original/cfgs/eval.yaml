@@ -1,0 +1,15 @@
+# PointCloud downstream eval config.
+n_classes: 40            # ModelNet40 (chance = 100 / 40 = 2.5%)
+ckpt: UPDATEME           # Path to the pretrained pointcloud checkpoint to evaluate
+data:
+  rotate: none           # sweep this over none | z | so3
+  # The remaining fields are inherited from the training checkpoint config.
+logging:
+  log_wandb: true
+  wandb_group:
+sweep:
+  param_grid:
+    data.rotate: [none, z, so3]
+# View-invariance study (TODO, optional): pretrain three checkpoints with
+# rotate=none|z|so3 and run this probe on each — accuracy should fall monotonically
+# as more rotation invariance is demanded (the headline of the track).
